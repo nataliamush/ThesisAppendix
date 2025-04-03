@@ -1,0 +1,678 @@
+---
+title: "Synth attempts"
+output: html_document
+date: "2025-02-01"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(microsynth)
+library(tictoc)
+library(data.table)
+library(lubridate)
+library(sf)
+library(tigris)
+library(fastDummies)
+library(readxl)
+library(tidyverse)
+library(arcgislayers)
+library(arcpullr)
+library(gridExtra)
+library(ggpubr)
+```
+
+## Data
+
+```{r read data}
+dest_agg <- read_csv('../data/alldata_nozeros_refinedcontrol_destgrouped.csv', col_types = 'cDdddddd') %>% mutate(across(ends_with('_expanded'), as.numeric)) %>% mutate(date_num = as.double((year(date_range_start) - 2018) * 12 + month(date_range_start))) %>% mutate(an_expansion = if_any(ends_with('_expanded')))
+```
+
+```{r contract_summary}
+# original code
+#borders <- states() %>% filter(NAME %in% c("Virginia", "Tennessee", "Georgia", "South Carolina"))
+# new code because data were pulled
+#borders <-arcgislayers::arc_read("https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/State_County/MapServer/18") %>% filter(NAME %in% c("Virginia", "Tennessee", "Georgia", "South Carolina"))
+#write_sf(borders, '../data/boundaries/nearby_states.gpkg') # not going to be burned by data going missing again!
+borders <- read_sf('../data/boundaries/nearby_states.gpkg')
+borders_buff <- borders %>% st_buffer(dist = 35000) %>% st_union() %>% st_make_valid() %>% st_transform(4326) %>% st_as_sf() %>% mutate(near_border = TRUE)
+all_expansions <- read_sf('../data/all_expansions_ncdot_data.shp')
+expansion_info <- all_expansions %>% st_join(borders_buff) %>% mutate(near_border = replace_na(near_border, FALSE))
+location_descriptions <- read_excel('../data/Completed Project List_withOSMids_noquo.xlsm') %>% 
+  select(`Contract Number`, `Location Description`) %>% deframe()
+# fill in a name for places that didn't get one from OSM
+
+expansion_info <- expansion_info %>% 
+  mutate(name = case_when(is.na(name) ~ location_descriptions[CntrctN],
+                          TRUE ~ name))
+
+affected_counts <- dest_agg %>% pivot_longer(ends_with('_expanded'), names_to = 'segment', values_to = 'affected') %>% 
+  filter(affected == 1) %>%
+  select(placekey, segment, affected) %>% # dropping the dates so I can select distinct combinations of placekey/segment. doesn't matter how many dates it shows up in
+  distinct() %>%
+  group_by(segment) %>% summarize(num_affected_destinations = n()) %>% arrange(desc(num_affected_destinations)) %>%
+  mutate(CntrctN = str_replace(str_replace(segment, 'C_', ''), '_expanded', ''))
+
+summary_table <- expansion_info %>% left_join(affected_counts, by='CntrctN') %>% 
+  select(CntrctN, name, date, near_border, num_affected_destinations, cntrct_) %>% 
+  mutate(name = str_replace_all(name, ',', ';')) %>% # so I don't break the csv
+  rename( 'Length (m)' = 'cntrct_') %>% # TODO: confirm that this is what this column is and that these are the right units
+  st_drop_geometry() %>% 
+  arrange(desc(num_affected_destinations)) %>%
+  replace_na(list(num_affected_destinations = 0)) %>%
+  mutate(analysis_id = seq(1,34))
+
+#write_csv(summary_table, '../figures/temp_segment_summary.csv')
+```
+
+
+```{r fill zeros DEPRECATED, NOT USED}
+df_zeros <- dest_agg |> complete(placekey, date_range_start, fill = list(total_count = 0,
+                                                                       avg_dist = 0,
+                                                                       vmt=0)) %>% 
+  select(placekey, date_range_start, avg_dist, total_count, vmt) %>% 
+  mutate(date_num = as.double((year(date_range_start) - 2018) * 12 + month(date_range_start)))
+########## add presence labels (code from alldata_expansion.R)
+route_labels <- read_sf('../data/dest_level_labeling/placekey_habitual_labels_nn.gpkg') %>% select(placekey.x, ends_with("blend"))  %>% rename('placekey' = 'placekey.x')
+
+df_zeros <- df_zeros %>% left_join(route_labels, by='placekey')
+
+colnames(df_zeros) <- gsub('present_', '', gsub('_blend', '', colnames(df_zeros)))
+
+# add expansion labels
+expansion_dates <- st_read('../data/all_expansions_ncdot_data.shp') %>% 
+  select(CntrctN, date) %>% 
+  st_drop_geometry() %>%
+  mutate(CntrctN = paste0('C_', CntrctN)) %>%
+  deframe() # making this a named list so I can use it in my new cool mutate across
+
+tic('create all expansion columns') # 38 sec
+df_zeros <- df_zeros %>%
+  select(-C_NA) %>%
+  mutate(
+    across(
+      .cols = starts_with('C_'),
+      .fns = ~ .x & (date_range_start > as.Date(expansion_dates[[cur_column()]])),
+      .names = '{.col}_expanded'
+    )
+  )
+toc()
+```
+
+```{r num destinations figures}
+dest_changes <- dest_agg %>% group_by(date_range_start) %>% summarize(num_destinations = n())
+
+expanded_keys <- (dest_agg %>% filter(an_expansion) %>% select(placekey) %>% distinct())$placekey
+expanded_keys_ver_time <- dest_agg %>% filter(placekey %in% expanded_keys) %>% group_by(date_range_start) %>% summarize(num_destinations = n())
+
+all_vs_expanded <- dest_changes %>% left_join(expanded_keys_ver_time, by='date_range_start', suffix=c('.total','.treated')) %>% mutate(ratio = num_destinations.total/num_destinations.treated)
+
+ggplot(all_vs_expanded) + 
+  geom_line(aes(x=date_range_start, y=num_destinations.total)) + 
+  geom_line(aes(x=date_range_start, y=num_destinations.treated), col='red') + 
+  theme_light() + 
+  labs(x = "Month", y = "Number of Destinations")
+
+all_expanded_long <- all_vs_expanded %>% pivot_longer(num_destinations.total:num_destinations.treated, names_to = "Type", values_to = "num_destinations")
+ggplot(all_expanded_long) + 
+  geom_line(aes(x=date_range_start, y=num_destinations, col=Type)) + 
+  scale_color_manual(values=c('black', 'red'), labels = c('Total Destinations', "Treated Destinations")) + 
+  theme_light() + 
+  theme(legend.position="top", legend.title=element_blank()) + 
+  labs(x = "Month", y = "Number of Destinations")
+
+ggsave("../figures/destinations_over_time.png", height = 4, width = 7, dpi = 600)
+# check how many expansions I have for each 
+```
+
+```{r generate 60-mo, 58-mo, 57-mo data}
+all_months <- dest_agg %>% group_by(placekey) %>% summarize(num_months = n())
+how_many_months <- all_months %>% group_by(num_months) %>% summarize(num_destinations = n()) %>% 
+  mutate(months_missing = 60-num_months) %>% arrange(desc(num_months)) %>% mutate(cumulative_destinations = cumsum(num_destinations))
+
+placekeys_60mo <- (all_months %>% filter(num_months == 60))$placekey
+placekeys_58mo <- (all_months %>% filter(num_months >= 58))$placekey
+placekeys_57mo <- (all_months %>% filter(num_months >= 57))$placekey
+
+dest_agg_nozero <- dest_agg %>% filter(placekey %in% placekeys_60mo)
+dest_agg_twomonth <- dest_agg %>% filter(placekey %in% placekeys_58mo)
+dest_agg_threemonth <- dest_agg %>% filter(placekey %in% placekeys_57mo)
+```
+
+
+
+
+```{r only the non-zero placekeys, so don't need fill zeros code - annotate}
+dest_agg_nozero %>% 
+  mutate(date_num = as.double((year(date_range_start) - 2018) * 12 + month(date_range_start)))
+
+nc_county <- read_sf('../data/boundaries/nc_dot_county.gpkg')
+
+poi_spatial <- read_csv('../data/poi_info/NC_monthlypatterns_poi_info_2018-01.csv') %>% 
+  st_as_sf(coords = c("longitude", "latitude"), crs=st_crs(4326)) %>% filter(placekey %in% dest_agg$placekey) %>% st_join(nc_county)
+annotated_nozero <- dest_agg_nozero %>% 
+  left_join(poi_spatial %>% select(placekey, naics_code, top_category, sub_category, naics_code, CountyName), 'placekey') %>%
+  mutate(across(CountyName, ~replace_na(., 'Carteret'))) %>% # there are two stupid placekeys that don't line up w county boundaries in the NC OneMap data, both beaches in Carteret County
+  mutate(naics_2 = substr(naics_code, 1, 2),
+         naics_3 = substr(naics_code, 1, 3)) %>%
+  mutate(across(ends_with('expanded'), as.numeric))
+dummy_annotated_nozero <- annotated_nozero %>% dummy_cols(select_columns = c('CountyName', 'naics_3')) # changed to CountyName from NAME (bc switch to NC onemap from tigris)
+```
+
+timeline: (http://www.mvapublicaffairs.com/2020/03/covid-19-nc-executive-orders/)
+May 22 – Phase 2 begins, effective through June 26.
+May 8 – Phase 1 of loosening statewide restrictions begins, effective through May 22.
+April 23 – Stay-at-home restrictions extended through May 8, and path to easing of state restrictions announced.
+March 30 – 30-day stay-at-home order begins.
+March 10 – State of Emergency declared.
+
+Phase II allowed:
+"Restaurants are allowed to operate for in-person dining, but are limited to 50% of their stated fire capacity.  Restaurant workers are encouraged to wear masks.
+Personal care services, grooming, and tattoo businesses may reopen, but are limited to 50% of their stated fire capacity.  Workers in these industries are required to wear masks."
+http://www.mvapublicaffairs.com/2020/04/covid-19-nc-path-forward-to-easing-restrictions/
+
+So allowing for 0 values in March, April, and May, can restrict to destinations that are present in 57 of the 60 months.
+
+```{r fill 57-month data and annotate}
+three_month_complete <- dest_agg_threemonth |> complete(placekey, date_range_start, fill = list(total_count = 0,
+                                                                       avg_dist = NA,
+                                                                       vmt=0)) %>% 
+  select(placekey, date_range_start, avg_dist, total_count, vmt) %>% 
+  mutate(date_num = as.double((year(date_range_start) - 2018) * 12 + month(date_range_start)))
+# for NA distances, use the midpoint between the distance in the time period previous and the time period after (first one to exist in both directions)
+
+three_month_filled <- three_month_complete %>% 
+  arrange(date_range_start) %>% # make sure they're in date order
+  group_by(placekey) %>% # fill will happen within groups
+  fill(avg_dist, .direction = 'downup') %>% # fill in both directions, starts with down
+  ungroup()
+
+#check
+# compare <- three_month_complete %>% 
+#   filter(placekey %in% date_dist$placekey) %>% 
+#   select(date_range_start, placekey, avg_dist) %>% 
+#   left_join(three_month_filled %>% select(date_range_start, placekey, avg_dist), by=c('placekey', 'date_range_start')) # looks good!!
+
+# doing intervention label from scratch just in case one of my NA destinations has NAs around the real intervention time, and I accidentally move it up a month for everyone
+three_month_filled <- three_month_filled %>% left_join(route_labels, by='placekey')
+colnames(three_month_filled) <- gsub('present_', '', gsub('_blend', '', colnames(three_month_filled)))
+
+tic('create all expansion columns') # 38 sec
+three_month_filled <- three_month_filled %>%
+  select(-C_NA) %>%
+  mutate(
+    across(
+      .cols = starts_with('C_'),
+      .fns = ~ .x & (date_range_start > as.Date(expansion_dates[[cur_column()]])),
+      .names = '{.col}_expanded'
+    )
+  )
+toc()
+
+annotated_3mo <- three_month_filled %>% 
+  left_join(poi_spatial %>% select(placekey, naics_code, top_category, sub_category, naics_code, CountyName), 'placekey') %>%
+  mutate(across(CountyName, ~replace_na(., 'Carteret'))) %>% # there are two stupid placekeys that don't line up w county boundaries in the NC OneMap data, both beaches in Carteret County
+  mutate(naics_2 = substr(naics_code, 1, 2),
+         naics_3 = substr(naics_code, 1, 3)) %>%
+  mutate(across(ends_with('expanded'), as.numeric))
+dummy_annotated_3mo <- annotated_3mo %>% dummy_cols(select_columns = c('CountyName', 'naics_3')) # changed to CountyName from NAME (bc switch to NC onemap from tigris)
+
+
+```
+```{r missing dates figure}
+## FIGURE...8?
+date_dist <- three_month_complete %>% filter(is.na(avg_dist))
+ggplot(date_dist) + 
+  geom_histogram(aes(x=date_range_start), bins = 60) + 
+  theme_light() + 
+  labs(x = "Month", y = "Number of destinations 'missing'")
+
+ggsave("../figures/missing_destinations.png", height = 4, width = 7, dpi = 600)
+```
+
+
+
+```{r data prep helper}
+# thanks to https://andrewpwheeler.com/2021/06/24/some-microsynth-notes/
+prep_synth <- function(mod){
+    #Grab the plot data
+    plotStats <- mod[['Plot.Stats']]
+    #For the left graph
+    Treat <- as.data.frame(t(plotStats$Treatment))
+    Treat$Type <- "Treat"
+    #This works for my data at Months, will not 
+    #Be right for data with more granular time though
+    Treat$Month <- as.integer(rownames(Treat))
+    Cont <- as.data.frame(t(plotStats$Control))
+    Cont$Type <- "Control"
+    Cont$Month <- as.integer(rownames(Cont))
+    AllRes <- rbind(Treat,Cont)
+    #For the right graph
+    Perm <- as.data.frame(t(as.data.frame(plotStats$Difference)))
+    SplitStr <- t(as.data.frame(strsplit(rownames(Perm),"[.]")))
+    colnames(SplitStr) <- c("Type","Month")
+    rownames(SplitStr) <- 1:nrow(SplitStr)
+    SplitStr <- as.data.frame(SplitStr)
+    Perm$Type <- as.character(SplitStr$Type)
+    Perm$Month <- as.integer(as.character(SplitStr$Month))
+    Perm$Group <- ifelse(Perm$Type == 'Main','Treatment Effect','Permutations') 
+    #Reordering factor levels for plots
+    AllRes$Type <- factor(AllRes$Type,levels=c('Treat','Control'))
+    levels(AllRes$Type) <- c('Treated','Synthetic Control')
+    Perm$Group <- factor(Perm$Group,levels=c('Treatment Effect','Permutations'))
+    #Exporting result
+    Res <- vector("list",length=2)
+    Res[[1]] <- AllRes
+    Res[[2]] <- Perm
+    names(Res) <- c("AggOutcomes","DiffPerms")
+    return(Res)
+}
+
+# function that sets all my parameters and such
+run_microsynth_nm <- function(which_var, which_data, prefix, covariates) {
+      attempt <- microsynth(which_data, 
+                      idvar='placekey', 
+                      timevar = 'date_num', 
+                      intvar = which_var,
+                      match.out = outcome_variables, 
+                      result.var = outcome_variables, 
+                      omnibus.var = outcome_variables, 
+                      match.covar = covariates,
+                      check.feas = T,
+                      use.backup = T,
+                      perm = 100,
+                      result.file = paste0('../figures/',prefix,'/', prefix, which_var) # originally ran to just put stuff in 'figures' but now i'm adding a prefix argument
+                      )
+      # save to file
+  plot_microsynth(attempt, main.tc=c(paste0(which_var, ": total count") ,paste0(which_var, ": avg dist")), file=paste0('../figures/',prefix,'/', prefix, which_var, '_temp.pdf'))
+return(attempt)
+}
+```
+
+
+## Models
+
+```{r more matching}
+outcome_variables <- c('total_count', 'avg_dist')
+```
+
+Restrict to expansions that have at least 6 months of pre-data and 6 months of post-data
+```{r eval=FALSE}
+pre <- expansion_dates[expansion_dates > as.Date('2018-06-06')]
+post <- pre[pre < as.Date('2022-07-01')]
+midtime_expansion_names <- paste0(names(post), '_expanded')
+present_expansions <- midtime_expansion_names[midtime_expansion_names %in% names(dummy_annotated_nozero)]
+
+summary_table <- summary_table %>% 
+  mutate(included_in_analysis = CntrctN %in% str_replace(midtime_expansion_names, 'C_', '')) 
+```
+
+
+Stat. inference:
+As noted previously, statistical inference is performed by up to three methods:
+(1) linearization, (2) jackknife, and (3) permutation. Linearization is performed so long as
+result.var is non-NULL; results are tabulated for the jackknife and permutations so long as jack>0 or perm>0
+
+### run for destinations in all 60 months
+
+```{r}
+# get the ones I actually want to run 
+over_100_obs <- annotated_nozero %>% pivot_longer(ends_with('_expanded'), names_to = 'segment', values_to = 'affected') %>% 
+  filter(affected == 1) %>%
+  select(placekey, segment, affected) %>% # dropping the dates so I can select distinct combinations of placekey/segment. doesn't matter how many dates it shows up in
+  distinct() %>%
+  group_by(segment) %>% summarize(num_affected_destinations = n()) %>% arrange(desc(num_affected_destinations)) %>% filter(num_affected_destinations > 100)
+
+covariates_nozero <- names(dummy_annotated_nozero %>% select(starts_with('CountyName'), starts_with('naics_3'), -CountyName, -naics_3))
+```
+
+```{r run 16 segments}
+tic('woop') # about 9 hours
+segment1 <- run_microsynth_nm(over_100_obs$segment[1], dummy_annotated_nozero, 'nozero_',covariates_nozero)
+segment2 <- run_microsynth_nm(over_100_obs$segment[2], dummy_annotated_nozero, 'nozero_',covariates_nozero)
+segment3 <- run_microsynth_nm(over_100_obs$segment[3], dummy_annotated_nozero, 'nozero_',covariates_nozero)
+segment4 <- run_microsynth_nm(over_100_obs$segment[4], dummy_annotated_nozero, 'nozero_',covariates_nozero)
+segment5 <- run_microsynth_nm(over_100_obs$segment[5], dummy_annotated_nozero, 'nozero_',covariates_nozero)
+segment6 <- run_microsynth_nm(over_100_obs$segment[6], dummy_annotated_nozero, 'nozero_',covariates_nozero)
+segment7 <- run_microsynth_nm(over_100_obs$segment[7], dummy_annotated_nozero, 'nozero_',covariates_nozero)
+segment8 <- run_microsynth_nm(over_100_obs$segment[8], dummy_annotated_nozero, 'nozero_',covariates_nozero)
+segment9 <- run_microsynth_nm(over_100_obs$segment[9], dummy_annotated_nozero, 'nozero_',covariates_nozero)
+segment10 <- run_microsynth_nm(over_100_obs$segment[10], dummy_annotated_nozero,'nozero_',covariates_nozero)
+segment11 <- run_microsynth_nm(over_100_obs$segment[11], dummy_annotated_nozero,'nozero_',covariates_nozero)
+segment12 <- run_microsynth_nm(over_100_obs$segment[12], dummy_annotated_nozero,'nozero_',covariates_nozero)
+segment13 <- run_microsynth_nm(over_100_obs$segment[13], dummy_annotated_nozero,'nozero_',covariates_nozero)
+segment14 <- run_microsynth_nm(over_100_obs$segment[14], dummy_annotated_nozero,'nozero_',covariates_nozero)
+segment15 <- run_microsynth_nm(over_100_obs$segment[15], dummy_annotated_nozero,'nozero_',covariates_nozero)
+segment16 <- run_microsynth_nm(over_100_obs$segment[16], dummy_annotated_nozero,'nozero_',covariates_nozero)
+toc()
+```
+```{r}
+# save all of these so I don't need to rerun
+save(list=c("segment1",
+            "segment2",
+            "segment3",
+            "segment4",
+            "segment5",
+            "segment6",
+            "segment7",
+            "segment8",
+            "segment9",
+            "segment10",
+            "segment11",
+            "segment12",
+            "segment13",
+            "segment14",
+            "segment15",
+            "segment16"
+            ), file="../figures/all_60mo_segmentmodels_updatedNAICS.RData")
+plot_microsynth(segment1)
+segment1$Results
+```
+
+```{r build results table for no-zero-months}
+summary_nozeros <- over_100_obs %>% 
+  mutate(CntrctN = str_replace(str_replace(segment, 'C_', ""), "_expanded", "")) %>%
+  left_join(expansion_info, by="CntrctN") %>%
+  select(CntrctN, segment, name, date, num_affected_destinations, cntrct_) %>% #I'm not keeping near_border because this is already those with over 100 observations, so it won't be any of those
+  mutate(name = str_replace_all(name, ',', ';')) %>% # so I don't break the csv
+  rename( 'Length (m)' = 'cntrct_') %>% # TODO: confirm that this is what this column is and that these are the right units
+  arrange(desc(num_affected_destinations)) %>% 
+  mutate(midtime = (date > as.Date('2018-06-01') & date < as.Date('2022-07-01'))) %>%
+  filter(midtime) #only keeping the ones with enough time before and after
+```
+
+
+```{r summarize the no-zero-month results}
+nozero_results <- vector("list", nrow(summary_nozeros))
+
+for (i in 1:nrow(summary_nozeros)) {
+  results <- read_csv(paste0("../figures/nozeros_run/", summary_nozeros$segment[i], ".csv")) %>% 
+    mutate(CntrctN = summary_nozeros$CntrctN[i])
+  nozero_results[[i]] <- results
+}
+
+nozero_results_tbl <- do.call(rbind, nozero_results)
+summary_nozeros_results <- summary_nozeros %>%
+  right_join(nozero_results_tbl, by='CntrctN')
+
+for_paper <- summary_nozeros_results %>%
+  #mutate(across(Linear.pVal:Perm.Upper, round, 2)) %>%
+  mutate(`...1` = case_when(`...1` == 'avg_dist' ~ "Average Distance",
+                            `...1` == 'total_count' ~ "Visitor Count",
+                            TRUE ~ `...1`)) %>%
+  mutate(across(c(Pct.Chng, Linear.Lower, Linear.Upper, Perm.Lower, Perm.Upper), ~  sprintf("%0.1f%%", .x * 100))) %>%
+  mutate(Linear.pVal = round(Linear.pVal, 2)) %>%
+  #mutate(across(everything(), ~replace(., . ==  "NA%" , "-"))) %>% # I can't figure out how to fix this so I'll just do in Word
+  rename('Value' = '...1',
+         'Number Affected Destinations' = 'num_affected_destinations') %>%
+  select(-segment, -date, -midtime, -`Length (m)`, -Trt, -Con)
+
+write_csv(for_paper, '../figures/allmonth_midtime_segment_results_updatedNAICS.csv')
+```
+
+
+### minus three months, repeat the no-zero code above
+```{r}
+# get the ones I actually want to run 
+over_100_obs_3mo <- annotated_3mo %>% pivot_longer(ends_with('_expanded'), names_to = 'segment', values_to = 'affected') %>% 
+  filter(affected == 1) %>%
+  select(placekey, segment, affected) %>% # dropping the dates so I can select distinct combinations of placekey/segment. doesn't matter how many dates it shows up in
+  distinct() %>%
+  group_by(segment) %>% summarize(num_affected_destinations = n()) %>% arrange(desc(num_affected_destinations)) %>% filter(num_affected_destinations > 100)
+
+covariates_3mo <- names(dummy_annotated_3mo %>% select(starts_with('CountyName'), starts_with('naics_3'), -CountyName, -naics_3))
+```
+
+```{r check dates}
+# to save time I want to comment out the segments that are before or after 6mo
+sort(expansion_dates)
+```
+
+
+```{r run 16 segments}
+tic('here we go again') 
+#segment1_3mo <- run_microsynth_nm(over_100_obs_3mo$segment[1], dummy_annotated_3mo, 'minus3_', covariates_3mo) #C203791
+segment2_3mo <- run_microsynth_nm(over_100_obs_3mo$segment[2], dummy_annotated_3mo, 'minus3_', covariates_3mo)
+segment3_3mo <- run_microsynth_nm(over_100_obs_3mo$segment[3], dummy_annotated_3mo, 'minus3_', covariates_3mo)
+segment4_3mo <- run_microsynth_nm(over_100_obs_3mo$segment[4], dummy_annotated_3mo, 'minus3_', covariates_3mo)
+segment5_3mo <- run_microsynth_nm(over_100_obs_3mo$segment[5], dummy_annotated_3mo, 'minus3_', covariates_3mo)
+segment6_3mo <- run_microsynth_nm(over_100_obs_3mo$segment[6], dummy_annotated_3mo, 'minus3_', covariates_3mo)
+#segment7_3mo <- run_microsynth_nm(over_100_obs_3mo$segment[7], dummy_annotated_3mo, 'minus3_', covariates_3mo)
+segment8_3mo <- run_microsynth_nm(over_100_obs_3mo$segment[8], dummy_annotated_3mo, 'minus3_', covariates_3mo)
+segment9_3mo <- run_microsynth_nm(over_100_obs_3mo$segment[9], dummy_annotated_3mo, 'minus3_', covariates_3mo)
+segment10_3mo <- run_microsynth_nm(over_100_obs_3mo$segment[10], dummy_annotated_3mo, 'minus3_', covariates_3mo)
+segment11_3mo <- run_microsynth_nm(over_100_obs_3mo$segment[11], dummy_annotated_3mo, 'minus3_', covariates_3mo)
+#segment12_3mo <- run_microsynth_nm(over_100_obs_3mo$segment[12], dummy_annotated_3mo, 'minus3_', covariates_3mo)
+segment13_3mo <- run_microsynth_nm(over_100_obs_3mo$segment[13], dummy_annotated_3mo, 'minus3_', covariates_3mo)
+segment14_3mo <- run_microsynth_nm(over_100_obs_3mo$segment[14], dummy_annotated_3mo, 'minus3_', covariates_3mo)
+segment15_3mo <- run_microsynth_nm(over_100_obs_3mo$segment[15], dummy_annotated_3mo, 'minus3_', covariates_3mo)
+#segment16_3mo <- run_microsynth_nm(over_100_obs_3mo$segment[16], dummy_annotated_3mo, 'minus3_', covariates_3mo)
+toc()
+```
+
+```{r}
+# save all of these so I don't need to rerun
+save(list=c(#"segment1_3mo",
+            "segment2_3mo",
+            "segment3_3mo",
+            "segment4_3mo",
+            "segment5_3mo",
+            "segment6_3mo",
+            #"segment7_3mo",
+            "segment8_3mo",
+            "segment9_3mo",
+            "segment10_3mo",
+            "segment11_3mo",
+            #"segment12_3mo",
+            "segment13_3mo",
+            "segment14_3mo",
+            "segment15_3mo"#,
+            #"segment16_3mo"
+            ), file="../figures/minus3mo_segmentmodels.RData")
+plot_microsynth(segment2_3mo)
+segment2_3mo$Results
+```
+
+```{r build results table for minus 3 months}
+summary_3mo <- over_100_obs_3mo %>% 
+  mutate(CntrctN = str_replace(str_replace(segment, 'C_', ""), "_expanded", "")) %>%
+  left_join(expansion_info, by="CntrctN") %>%
+  select(CntrctN, segment, name, date, num_affected_destinations, cntrct_) %>% #I'm not keeping near_border because this is already those with over 100 observations, so it won't be any of those
+  mutate(name = str_replace_all(name, ',', ';')) %>% # so I don't break the csv
+  rename( 'Length (m)' = 'cntrct_') %>% # TODO: confirm that this is what this column is and that these are the right units
+  arrange(desc(num_affected_destinations)) %>% 
+  mutate(midtime = (date > as.Date('2018-06-01') & date < as.Date('2022-07-01'))) %>%
+  filter(midtime) #only keeping the ones with enough time before and after
+```
+
+
+```{r summarize the minus 3 mo results}
+w3mo_results <- vector("list", nrow(summary_3mo))
+
+for (i in 1:nrow(summary_3mo)) {
+  
+  results <- read_csv(paste0("../figures/minus3_/", "minus3_", summary_3mo$segment[i], ".csv")) %>% 
+    mutate(CntrctN = summary_3mo$CntrctN[i])
+  w3mo_results[[i]] <- results
+}
+
+w3mo_results_tbl <- do.call(rbind, w3mo_results)
+summary_3mo_results <- summary_3mo %>%
+  right_join(w3mo_results_tbl, by='CntrctN')
+
+# come back to this
+for_paper_3mo <- summary_3mo_results %>%
+  #mutate(across(Linear.pVal:Perm.Upper, round, 2)) %>%
+  mutate(`...1` = case_when(`...1` == 'avg_dist' ~ "Average Distance",
+                            `...1` == 'total_count' ~ "Visitor Count",
+                            TRUE ~ `...1`)) %>%
+  mutate(across(c(Pct.Chng, Linear.Lower, Linear.Upper, Perm.Lower, Perm.Upper), ~  sprintf("%0.1f%%", .x * 100))) %>%
+  mutate(Linear.pVal = round(Linear.pVal, 2)) %>%
+  #mutate(across(everything(), ~replace(., . ==  "NA%" , "-"))) %>% # I can't figure out how to fix this so I'll just do in Word
+  rename('Value' = '...1',
+         'Number Affected Destinations' = 'num_affected_destinations') %>%
+  select(-segment, -date, -midtime, -`Length (m)`, -Trt, -Con)
+
+write_csv(for_paper_3mo, '../figures/w3mo_midtime_segment_results.csv')
+```
+
+### make better figures
+```{r}
+relevant_seg <- over_100_obs_3mo$segment[5]
+plot_title <- (summary_3mo %>% filter(segment == relevant_seg) %>% pull(name))[1]
+ex_data <- prep_synth(segment5_3mo)
+ex_outcomes <- ex_data[[1]] %>% mutate(Month = as.Date('2017-12-01') %m+% months(Month),
+                                       avg_dist = avg_dist/1000) # converting to dates for figures, converting to KM even though that isn't so useful
+ex_permutations <- ex_data[[2]] %>% mutate(Month = as.Date('2017-12-01') %m+% months(Month),
+                                           avg_dist = avg_dist/1000)
+
+tc_trtcon <- ggplot(ex_outcomes) + geom_line(aes(x=Month, y=total_count, col=Type, linetype = Type, size=Type)) +
+            scale_color_manual(values=c('red','black'))+ scale_size_manual(values=c(0.3,0.25)) +
+  theme_light() +
+  labs(y="Agg. Visitor Count") + 
+  theme(legend.position="top", legend.title=element_blank())
+ad_trtcon <- ggplot(ex_outcomes) + geom_line(aes(x=Month, y=avg_dist, col=Type, linetype = Type, size=Type)) +
+            scale_color_manual(values=c('red','black')) + scale_size_manual(values=c(0.3,0.25)) +
+  theme_light() +
+  labs(y="Agg. Avg. Dist. (km)") + 
+  theme(legend.position="top", legend.title=element_blank())
+
+#need to fix this to have the red line on top
+ad_diff <- ggplot(mapping= aes(x=Month,y=avg_dist,group=Type,color=Group,size=Group)) + 
+            geom_line(data = ex_permutations %>% filter(Group != "Treatment Effect")) +
+  geom_line(data = ex_permutations %>% filter(Group == "Treatment Effect")) +
+            scale_color_manual(values=c('grey','red')) + scale_size_manual(values=c(0.25,0.25)) + 
+  theme_light() +
+  labs(y="Diff. in Avg. Dist. (km)") +
+  theme(legend.position="top", legend.title=element_blank())
+tc_diff <- ggplot(mapping= aes(x=Month,y=total_count,group=Type,color=Group,size=Group)) + 
+            geom_line(data = ex_permutations %>% filter(Group != "Treatment Effect")) +
+  geom_line(data = ex_permutations %>% filter(Group == "Treatment Effect")) +
+            scale_color_manual(values=c('grey','red')) + scale_size_manual(values=c(0.25,0.25)) + 
+  theme_light() +
+  labs(y = "Diff. in Visitor Counts") + 
+  theme(legend.position="top", legend.title=element_blank())
+
+# grid.arrange(tc_trtcon, tc_diff, ad_trtcon, ad_diff, nrow=1)
+# g <- arrangeGrob(tc_trtcon, tc_diff, ad_trtcon, ad_diff,ncol=4)
+# g
+fig <- ggarrange(tc_trtcon, tc_diff, ad_trtcon, ad_diff,ncol=4,legend="none")
+annotate_figure(fig, top = text_grob(plot_title, 
+              face = "bold", size = 12))
+ggsave("../figures/testplot.png", height = 2, width = 9, dpi = 600)
+```
+wrapping plotting code in a function:
+```{r plot function}
+better_plot <- function(results_obj, table_row, whichmodel) {
+  relevant_seg <- table_row
+plot_title <- (summary_3mo %>% filter(segment == relevant_seg) %>% pull(name))[1]
+ex_data <- prep_synth(results_obj)
+ex_outcomes <- ex_data[[1]] %>% mutate(Month = as.Date('2017-12-01') %m+% months(Month),
+                                       avg_dist = avg_dist/1000) # converting to dates for figures, converting to KM even though that isn't so useful
+ex_permutations <- ex_data[[2]] %>% mutate(Month = as.Date('2017-12-01') %m+% months(Month),
+                                           avg_dist = avg_dist/1000)
+
+tc_trtcon <- ggplot(ex_outcomes) + geom_line(aes(x=Month, y=total_count, col=Type, linetype = Type, size=Type)) +
+            scale_color_manual(values=c('red','black'))+ scale_size_manual(values=c(0.3,0.25)) +
+  theme_light() +
+  labs(y="Agg. Visitor Count") + 
+  theme(legend.position="top", legend.title=element_blank())
+ad_trtcon <- ggplot(ex_outcomes) + geom_line(aes(x=Month, y=avg_dist, col=Type, linetype = Type, size=Type)) +
+            scale_color_manual(values=c('red','black')) + scale_size_manual(values=c(0.3,0.25)) +
+  theme_light() +
+  labs(y="Agg. Avg. Dist. (km)") + 
+  theme(legend.position="top", legend.title=element_blank())
+
+#need to fix this to have the red line on top
+ad_diff <- ggplot(mapping= aes(x=Month,y=avg_dist,group=Type,color=Group,size=Group)) + 
+            geom_line(data = ex_permutations %>% filter(Group != "Treatment Effect")) +
+  geom_line(data = ex_permutations %>% filter(Group == "Treatment Effect")) +
+            scale_color_manual(values=c('grey','red')) + scale_size_manual(values=c(0.25,0.25)) + 
+  theme_light() +
+  labs(y="Diff. in Avg. Dist. (km)") +
+  theme(legend.position="top", legend.title=element_blank())
+tc_diff <- ggplot(mapping= aes(x=Month,y=total_count,group=Type,color=Group,size=Group)) + 
+            geom_line(data = ex_permutations %>% filter(Group != "Treatment Effect")) +
+  geom_line(data = ex_permutations %>% filter(Group == "Treatment Effect")) +
+            scale_color_manual(values=c('grey','red')) + scale_size_manual(values=c(0.25,0.25)) + 
+  theme_light() +
+  labs(y = "Diff. in Visitor Counts") + 
+  theme(legend.position="top", legend.title=element_blank())
+
+# grid.arrange(tc_trtcon, tc_diff, ad_trtcon, ad_diff, nrow=1)
+# g <- arrangeGrob(tc_trtcon, tc_diff, ad_trtcon, ad_diff,ncol=4)
+# g
+fig <- ggarrange(tc_trtcon, tc_diff, ad_trtcon, ad_diff,ncol=4,legend="none")
+annotate_figure(fig, top = text_grob(plot_title, 
+              face = "bold", size = 12))
+ggsave(paste0("../figures/", whichmodel, "/", whichmodel, plot_title, ".png"), height = 2, width = 9, dpi = 600)
+}
+```
+
+plot em all!
+
+```{r}
+# 4 of the 16 all-month plots won't be used, because they were unneccessarily run (expansion in first or last 6 months), but I'm still generating plots to make sure I don't get them wrong
+better_plot(segment1, over_100_obs$segment[1], "allmonths")
+better_plot(segment2, over_100_obs$segment[2], "allmonths")
+better_plot(segment3, over_100_obs$segment[3], "allmonths")
+better_plot(segment4, over_100_obs$segment[4], "allmonths")
+better_plot(segment5, over_100_obs$segment[5], "allmonths")
+better_plot(segment6, over_100_obs$segment[6], "allmonths")
+better_plot(segment7, over_100_obs$segment[7], "allmonths")
+better_plot(segment8, over_100_obs$segment[8], "allmonths")
+better_plot(segment9, over_100_obs$segment[9], "allmonths")
+better_plot(segment10, over_100_obs$segment[10], "allmonths")
+better_plot(segment11, over_100_obs$segment[11], "allmonths")
+better_plot(segment12, over_100_obs$segment[12], "allmonths")
+better_plot(segment13, over_100_obs$segment[13], "allmonths")
+better_plot(segment14, over_100_obs$segment[14], "allmonths")
+better_plot(segment15, over_100_obs$segment[15], "allmonths")
+better_plot(segment16, over_100_obs$segment[16], "allmonths")
+
+better_plot(segment2_3mo, over_100_obs_3mo$segment[2], "57mo")
+better_plot(segment3_3mo, over_100_obs_3mo$segment[3], "57mo")
+better_plot(segment4_3mo, over_100_obs_3mo$segment[4], "57mo")
+better_plot(segment5_3mo, over_100_obs_3mo$segment[5], "57mo")
+better_plot(segment6_3mo, over_100_obs_3mo$segment[6], "57mo")
+better_plot(segment8_3mo, over_100_obs_3mo$segment[8], "57mo")
+better_plot(segment9_3mo, over_100_obs_3mo$segment[9], "57mo")
+better_plot(segment10_3mo, over_100_obs_3mo$segment[10], "57mo")
+better_plot(segment11_3mo, over_100_obs_3mo$segment[11], "57mo")
+better_plot(segment13_3mo, over_100_obs_3mo$segment[13], "57mo")
+better_plot(segment14_3mo, over_100_obs_3mo$segment[14], "57mo")
+better_plot(segment15_3mo, over_100_obs_3mo$segment[15], "57mo")
+```
+
+
+```{r}
+# use this legend on each page of figures
+# ggsave('../figures/treat_con_legend.png', get_legend(tc_trtcon))
+# ggsave('../figures/permutation_legend.png', get_legend(tc_diff))
+```
+
+
+summary table (tbl 2)
+```{r}
+full_summary_60 <- annotated_nozero %>% pivot_longer(ends_with('_expanded'), names_to = 'segment', values_to = 'affected') %>% 
+  filter(affected == 1) %>%
+  select(placekey, segment, affected) %>% # dropping the dates so I can select distinct combinations of placekey/segment. doesn't matter how many dates it shows up in
+  distinct() %>%
+  group_by(segment) %>% summarize(num_affected_destinations = n()) %>% arrange(desc(num_affected_destinations)) %>% 
+  mutate(CntrctN = str_replace(str_replace(segment, 'C_', ""), "_expanded", "")) %>%
+  left_join(expansion_info, by="CntrctN") %>%
+  select(CntrctN, segment, name, date, num_affected_destinations, cntrct_) %>% #I'm not keeping near_border because this is already those with over 100 observations, so it won't be any of those
+  mutate(name = str_replace_all(name, ',', ';')) %>% # so I don't break the csv
+  rename( 'Length (m)' = 'cntrct_') %>% # TODO: confirm that this is what this column is and that these are the right units
+  arrange(desc(num_affected_destinations)) %>% 
+  mutate(midtime = (date > as.Date('2018-06-01') & date < as.Date('2022-07-01')))
+
+summary_57 <- annotated_3mo %>% pivot_longer(ends_with('_expanded'), names_to = 'segment', values_to = 'affected') %>% 
+  filter(affected == 1) %>%
+  select(placekey, segment, affected) %>% # dropping the dates so I can select distinct combinations of placekey/segment. doesn't matter how many dates it shows up in
+  distinct() %>%
+  group_by(segment) %>% summarize(num_affected_destinations = n()) %>% arrange(desc(num_affected_destinations))
+
+table2 <- full_summary_60 %>% left_join(summary_57, by='segment', suffix = c("_60", "_57")) %>% mutate(included = midtime & num_affected_destinations_60 > 100)
+table2 %>% select(CntrctN, name, date, num_affected_destinations_60, num_affected_destinations_57, included) %>% write_csv('../figures/updated_table2.csv')
+```
+

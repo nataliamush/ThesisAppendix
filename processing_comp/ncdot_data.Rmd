@@ -1,0 +1,157 @@
+---
+title: "Processing Widening Data"
+author: "Natalia Mushegian"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(readxl)
+library(sf)
+library(osmextract)
+library(tmap)
+library(tictoc)
+library(tigris)
+```
+
+Reading and processing data from NC DOT Received May 13th, 2024 from Meredith Vick (msvick@ncdot.gov) - "Please see attached.  Our construction unit indicated we can’t create the formats requested but did add in a couple more columns that were shown on the STIP list (counties, route numbers).  The output of our contract admin software shows each county and route in a line by itself, so there will be multiple lines for each contract."
+
+```{r}
+all_projects <- read_excel('../data/Completed Project List_withOSMids_noquo.xlsm')
+widening <- all_projects %>% filter(grepl("WIDENING",`Contract Description`))
+```
+
+
+```{r}
+contracts <- widening %>% group_by(`Contract Number`) %>% summarise(county = first(County), location = first(`Location Description`), description = first(`Contract Description`), routettype = first(`Route Type`), routenum = first(`Route Number`), date = max(`Acceptance Date`), nchunks = n()) %>% arrange(date) #not totally correct route number, which is somehow different for each of the chunks
+
+#widening <- widening %>% mutate(id_list = split(OSMids, ' '))
+```
+
+Example: SR-1003 (CAMDEN RD) FROM EAST OF OAKLAND AVE TO NORTH OF SR-1007 (OWEN DR).
+
+This link shows it was actually a multiphase project: https://www.fayettevillenc.gov/Home/Components/News/News/6761/397?arch=1
+
+```{r}
+# getting osm data from a download instead of pulling from web
+#"This file was last modified 17 hours ago and contains all OSM data up to 2024-07-01T20:21:29Z"
+
+#worked - 2354915 obs (more roads than we need), tags in extra_tags
+#nc <- oe_read('north-carolina-latest.osm.pbf')
+
+#worked - 447122 obs, correct tags as columns (incl. oneway)
+tic('read osm data')
+nc <- oe_read('../data/north-carolina-latest.osm.pbf', extra_tags = c('oneway', 'maxspeed'), query="SELECT *
+              FROM 'lines'
+              WHERE highway IN ('motorway', 'primary', 'secondary', 'tertiary', 'trunk', 'residential')")#,
+              #force_vectortranslate = TRUE)
+toc() #31 sec
+
+nc <- nc  %>% st_transform(crs=st_crs(32616)) # needed for the inner buffer in km
+
+#write_sf(nc, 'northcarolinaroads.shp') # saving the shp in case it's faster to read than the .pbf
+
+# now there's a north-carolina-latest.gpkg, can read that to skip the conversion but still need other options? check this out later but aborting this attempt for now
+#nc_gpkg <- oe_read('north-carolina-latest.gpkg')
+```
+
+```{r filter_osm}
+#cleaning up my OSM id sins
+split_ids <- widening %>% separate(OSMids, into=paste0("id",1:81), sep = ' ') %>% # hard coded to the max number of segments in one of my widenings - 81
+  filter(id1 != 'unclear' & id1 != "can't" & id1 != "Greene")
+
+pivoted <- split_ids %>% pivot_longer(cols=starts_with('id'), values_to = "osm_id") %>% filter(!is.na(osm_id)) # drop a huge number of NAs from contracts that had only a few segments
+
+wide_roads <- nc %>% filter(osm_id %in% pivoted$osm_id)
+
+# below for reading from file rather than running the code
+#write_sf(wide_roads, 'expandedroads.shp') # saving the shp to avoid loading and filtering all NC roads again - to be updated when I add more roads. NOTE: not all info in other_tags preserved
+#wide_roads <- read_sf('expandedroads.shp')
+```
+
+```{r keep contract info}
+wide_roads <- left_join(wide_roads, (pivoted %>% select(`Contract Number`, `Contract Description`, `Acceptance Date`, osm_id)), by='osm_id')
+wide_contracts <- wide_roads %>% group_by(`Contract Number`) %>% summarise(name = first(name),
+                                                         description = first(`Contract Description`),
+                                                         maxspeed = first(maxspeed),
+                                                         highway = first(highway),
+                                                         oneway=first(oneway),
+                                                         date = first(`Acceptance Date`),
+                                                         OSMids = list(osm_id))
+```
+
+
+
+```{r show_em}
+tmap_mode("view")
+tm_shape(wide_contracts) + tm_lines(col='red', id='name', legend.col.show = FALSE)
+```
+
+Toss borders, cut big projects, cut by number of lanes? or a state classification (use state roads database)
+
+1. Remove anything within X distance of a border (thinking 20 or 30 miles)
+2. Remove anything classified as 'motorway'
+3. Remove any combined segment longer than 10 miles
+
+I'm running this all on *wide_contracts* right now because it's easier to make sure I'm treating all the segments of one contract together, but will eventually want to switch back to wide_roads probably so that I keep the matching OSMids. or maybe i go back and extract them via overlap or something?
+
+```{r}
+nc_counties <- counties("NC") %>% st_transform(crs=st_crs(32616))
+nc_poly <- states() %>% filter(GEOID == 37) %>% st_transform(crs=st_crs(32616))
+nc_inner <- st_buffer(nc_poly, -30000)
+#plot(nc_inner)
+
+length_threshold <- 15000 #-> need a histogram of segment lengths
+units(length_threshold) <- "m"
+
+# 38 contracts originally pre filtering
+shortlist <- wide_contracts %>% filter(highway != "motorway") %>% # goes down to 36 after this
+  st_filter(nc_inner, .predicate = st_within) %>% # now 21 with 30km buffer, this cuts some coastal stuff that probably doesn't need to be cut
+  mutate(contract_length = st_length(.)) %>%
+  filter(contract_length < length_threshold) %>% # now 19 for contracts less than 15 km
+  filter(date > as.Date("2019-01-01")) %>% # now 15
+  filter(date < as.Date("2022-01-01")) # now 10
+  
+tm_shape(shortlist) + tm_lines(col='date', id='name', palette = "RdBu")
+
+#write_sf(shortlist, "expansions_shortlist_20240805.shp")
+
+#instead of cutting stuff out, just adding additional labels. highway label already in there, no need to add
+expanded_tagged <- wide_contracts %>% mutate(inner_state_30km = as.numeric(st_within(wide_contracts, nc_inner)) > 0) %>% # add a label for things in the inner region (not 30 km)
+  mutate(contract_length = st_length(.)) %>% # add a length label
+  select(-OSMids) %>% # dropping these because they don't write well to shapefile and i'd rather re-read them later
+  st_transform(crs = st_crs(4326)) # to match the routes data
+
+write_sf(expanded_tagged, "../data/all_expansions_ncdot_data.shp") # use this file in label_od
+
+```
+
+
+```{r}
+buffer_30km <- shortlist %>% st_buffer(30*1000)
+buffer_60km <- shortlist %>% st_buffer(60*1000)
+
+tmap_mode('view')
+tm_shape(buffer_60km) + tm_polygons(col='blue') + tm_shape(buffer_30km) + tm_polygons() + tm_shape(wide_contracts) + tm_lines() + tm_shape(shortlist) + tm_lines(col='red')
+```
+
+
+
+
+Shortlist and comments:
+
+"Battleground Avenue" - https://www.ncdot.gov/projects/us-220-widening-greensboro/Documents/december-2018-public-comment-summary.pdf, http://grra.org/wp-content/uploads/2018/12/Fall-2018-1.pdf, may be too big (filter out trunk too?)
+
+"Camden Road" - press release: https://www.fayettevillenc.gov/Home/Components/News/News/6761/ this shows that while the acceptance date is 2019, half of the project opened by 2017
+more construction more recently, https://www.nc-eminent-domain.com/latest-projects/camden-road-widening/     this seems related: https://www.ncdot.gov/projects/fayetteville-outer-loop/Pages/project-highlights.aspx
+
+"River Road"                
+"Strickland Bridge Road"   
+NA                          
+"Ramsey Street"             
+"Lakewood Drive"            
+"East 4th Avenue"           
+"Lick Creek Church Road"    
+"Coach Deal Road"           
